@@ -8,9 +8,9 @@ from vnpy.event import EventEngine, Event
 from vnpy.chart import ChartWidget, CandleItem, VolumeItem
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.ui import QtWidgets, QtCore
-from vnpy.trader.event import EVENT_TICK
+from vnpy.trader.event import EVENT_TICK, EVENT_CONTRACT
 from vnpy.trader.object import ContractData, TickData, BarData, SubscribeRequest
-from vnpy.trader.utility import BarGenerator, ZoneInfo
+from vnpy.trader.utility import BarGenerator, ZoneInfo, extract_vt_symbol
 from vnpy.trader.constant import Interval, Exchange
 from vnpy_spreadtrading.base import SpreadItem, EVENT_SPREAD_DATA
 
@@ -23,6 +23,7 @@ class ChartWizardWidget(QtWidgets.QWidget):
     signal_tick: QtCore.Signal = QtCore.Signal(Event)
     signal_spread: QtCore.Signal = QtCore.Signal(Event)
     signal_history: QtCore.Signal = QtCore.Signal(Event)
+    signal_contract: QtCore.Signal = QtCore.Signal(Event)
 
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         """构造函数"""
@@ -34,6 +35,7 @@ class ChartWizardWidget(QtWidgets.QWidget):
 
         self.bgs: dict[str, BarGenerator] = {}
         self.charts: dict[str, ChartWidget] = {}
+        self.pending: set[str] = set()      # 等待合约信息返回的代码（自定义扩展）
 
         self.init_ui()
         self.register_event()
@@ -88,17 +90,72 @@ class ChartWizardWidget(QtWidgets.QWidget):
 
     def new_chart(self) -> None:
         """创建新的图表"""
-        # Filter invalid vt_symbol
-        vt_symbol: str = self.symbol_line.text()
+        vt_symbol: str = self.normalize_vt_symbol(self.symbol_line.text())
         if not vt_symbol:
             return
 
+        self.symbol_line.setText(vt_symbol)
+        self.open_chart(vt_symbol)
+
+    def normalize_vt_symbol(self, text: str) -> str:
+        """
+        规范化输入的代码（自定义扩展）：
+        期货简写代码自动转大写并补全交易所，例如 mes -> MES.CME
+        """
+        text = text.strip()
+        if not text:
+            return ""
+
+        try:
+            from vnpy_ib.future_alias import FUTURE_ALIASES
+        except ImportError:
+            return text
+
+        if "." in text:
+            symbol, exchange = text.rsplit(".", 1)
+            if symbol.upper() in FUTURE_ALIASES:
+                symbol = symbol.upper()
+            return f"{symbol}.{exchange.upper()}"
+
+        alias = FUTURE_ALIASES.get(text.upper(), None)
+        if alias:
+            return f"{text.upper()}.{alias.exchange}"
+
+        return text
+
+    def subscribe_pending(self, vt_symbol: str) -> None:
+        """合约信息不存在时先订阅，合约返回后再创建图表（自定义扩展）"""
+        try:
+            symbol, exchange = extract_vt_symbol(vt_symbol)
+        except ValueError:
+            return
+
+        gateway_names: list[str] = self.main_engine.get_all_gateway_names()
+        if not gateway_names:
+            return
+
+        self.pending.add(vt_symbol)
+
+        req: SubscribeRequest = SubscribeRequest(symbol, exchange)
+        for gateway_name in gateway_names:
+            self.main_engine.subscribe(req, gateway_name)
+
+    def process_contract_event(self, event: Event) -> None:
+        """合约信息返回后，创建等待中的图表（自定义扩展）"""
+        contract: ContractData = event.data
+        if contract.vt_symbol in self.pending:
+            self.pending.discard(contract.vt_symbol)
+            self.open_chart(contract.vt_symbol)
+
+    def open_chart(self, vt_symbol: str) -> None:
+        """打开指定代码的图表"""
         if vt_symbol in self.charts:
             return
 
         if "LOCAL" not in vt_symbol:
             contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
             if not contract:
+                self.subscribe_pending(vt_symbol)
                 return
 
         # Create new chart
@@ -125,10 +182,12 @@ class ChartWizardWidget(QtWidgets.QWidget):
         self.signal_tick.connect(self.process_tick_event)
         self.signal_history.connect(self.process_history_event)
         self.signal_spread.connect(self.process_spread_event)
+        self.signal_contract.connect(self.process_contract_event)
 
         self.event_engine.register(EVENT_CHART_HISTORY, self.signal_history.emit)
         self.event_engine.register(EVENT_TICK, self.signal_tick.emit)
         self.event_engine.register(EVENT_SPREAD_DATA, self.signal_spread.emit)
+        self.event_engine.register(EVENT_CONTRACT, self.signal_contract.emit)
 
     def process_tick_event(self, event: Event) -> None:
         """处理Tick事件"""
@@ -137,6 +196,10 @@ class ChartWizardWidget(QtWidgets.QWidget):
 
         if bg:
             bg.update_tick(tick)
+
+            # 尚未收到有效成交价时K线还没生成，跳过（修复NoneType报错）
+            if not bg.bar:
+                return
 
             chart: ChartWidget = self.charts[tick.vt_symbol]
             bar: BarData = cast(BarData, copy(bg.bar))
@@ -181,6 +244,10 @@ class ChartWizardWidget(QtWidgets.QWidget):
         bg: BarGenerator | None = self.bgs.get(tick.vt_symbol, None)
         if bg:
             bg.update_tick(tick)
+
+            # 尚未收到有效成交价时K线还没生成，跳过（修复NoneType报错）
+            if not bg.bar:
+                return
 
             chart: ChartWidget = self.charts[tick.vt_symbol]
             bar: BarData = cast(BarData, copy(bg.bar))
